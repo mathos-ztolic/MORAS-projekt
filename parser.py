@@ -2,138 +2,10 @@
 import itertools
 import re
 from sys import argv, stderr
-from typing import Mapping, NamedTuple, Optional, Callable, Generator
+from typing import Mapping, NamedTuple, Optional, Callable
 
-
-class ParserLine(NamedTuple):
-    line: str
-    lineno_parsed: int
-    lineno_original: int
-
-class SimpleMacro(NamedTuple):
-
-    arguments: tuple[str, ...]
-    
-    def run(self, line: str, p: int, o: int) -> str:
-        raise NotImplementedError
-
-class BlockMacro(NamedTuple):
-
-    arguments: tuple[str, ...]
-    open_p: int  # p from when the block was opened
-    open_o: int  # o from when the block was opened
-    
-    def open(self, line: str, p: int, o: int) -> str:
-        raise NotImplementedError
-    
-    def close(self, line: str, p: int, o: int) -> str:
-        raise NotImplementedError
-
-class MVMacro(SimpleMacro):
-
-    def run(self, line: str, p: int, o: int) -> str:
-        A = self.arguments[0]
-        B = self.arguments[1]
-        return f'@{A}\nD=M\n@{B}\nM=D'
-
-class SETMacro(SimpleMacro):
-
-    def run(self, line: str, p: int, o: int) -> str:
-        A = self.arguments[0]
-        B = self.arguments[1]
-
-        try:
-            B = int(B)
-        except ValueError:
-            raise ParserError(
-                'MCR',
-                'Nevalidan SET Macro. Drugi argument mora biti broj. '
-                'Mozda ste htjeli MV?',
-                o,
-            )
-
-        if B in (-1, 0, 1):
-            return f'@{A}\nM={B}'
-
-        return (f'@{B}\nD=A\n@{A}\nM=D'
-                if B >= 0 else
-                f'@{~B}\nD=A\nD=!D\n@{A}\nM=D')
-
-class HALTMacro(SimpleMacro):
-
-    def run(self, line: str, p: int, o: int) -> str:
-        return f'(__halt_{o})\n@__halt_{o}\n0;JMP'
-
-class SWPMacro(SimpleMacro):
-
-    def run(self, line: str, p: int, o: int) -> str:
-        A = self.arguments[0]
-        B = self.arguments[1]
-        A_ptr_count = len([*itertools.takewhile(lambda c: c == '*', A)])
-        B_ptr_count = len([*itertools.takewhile(lambda c: c == '*', B)])
-        A_real = A[A_ptr_count:]
-        B_real = B[B_ptr_count:]
-        if not A_real or not B_real:
-            raise ParsingError('MCR', "Nevalidan SWP macro.", o)
-        A_str = 'A=M\n'*A_ptr_count
-        B_str = 'A=M\n'*B_ptr_count
-        return (f'@{A_real}\n{A_str}D=M\n@__aux\nM=D\n@{B_real}\n{B_str}D=M\n'
-                f'@{A_real}\n{A_str}M=D\n@__aux\nD=M\n@{B_real}\n{B_str}M=D')
-
-class SUMMacro(SimpleMacro):
-
-    def run(self, line: str, p: int, o: int) -> str:
-        A = self.arguments[0]
-        B = self.arguments[1]
-        D = self.arguments[2]
-        return f'@{A}\nD=M\n@{B}\nD=D+M\n@{D}\nM=D'
-
-class SUBMacro(SimpleMacro):
-
-    def run(self, line: str, p: int, o: int) -> str:
-        A = self.arguments[0]
-        B = self.arguments[1]
-        D = self.arguments[2]
-        return f'@{A}\nD=M\n@{B}\nD=D-M\n@{D}\nM=D'
-
-class DOWHILEMacro(BlockMacro):
-    
-    def open(self, line: str, p: int, o: int) -> str:
-        A = self.arguments[0]
-        return f'(__while_{A}_{o})'
-
-    def close(self, line: str, p: int, o: int) -> str:
-        A = self.arguments[0]
-        var = f'__while_{A}_{self.open_o}'
-        return f'@{A}\nD=M\n@__while_{A}_{self.open_o}\nD;JNE'
-
-class WHILEMacro(BlockMacro):
-    
-    def open(self, line: str, p: int, o: int) -> str:
-        A = self.arguments[0]
-        var = f'__while_{A}_{o}'
-        var_after = f'__while_{A}_{o}_after'
-        return f"@{A}\nD=M\n@{var_after}\nD;JEQ\n({var})"
-
-    def close(self, line: str, p: int, o: int) -> str:
-        A = self.arguments[0]
-        var = f'__while_{A}_{self.open_o}'
-        var_after = f'__while_{A}_{self.open_o}_after'
-        return f'@{A}\nD=M\n@{var}\nD;JNE\n({var_after})'
-
-
-class ParsingError(Exception):
-    def __init__(self, src: str, msg: str, lineno: int):
-        self.src = src
-        self.msg = msg
-        self.lineno = lineno
-
-def sliding_substring(string: str, n: int = 2) -> Generator[str, None, None]:
-    if len(string) <= n:
-        yield string
-        return
-    for i in range(len(string) - n + 1):
-        yield string[i:i+n]
+from macros import *
+from utils import *
 
 class Parser:
     _lines: list[ParserLine]
@@ -143,8 +15,8 @@ class Parser:
     _current_variable: int
     filename: str
     output_filename: str
-    _block_stack: list[str]
-    _block_macro_stack: list[BlockMacro]
+    _block_stack: list[tuple[str, bool]]
+    _block_macro_stack: list[tuple[BlockMacro, bool]]
     expand_macros_only: bool
     
     OPERATIONS = {"0": "0101010", "1": "0111111", "-1": "0111010",
@@ -166,23 +38,62 @@ class Parser:
     DESTINATIONS = {"" : "000", "M" : "001", "D" : "010", "MD" : "011",
                     "A" : "100", "AM" : "101", "AD" : "110", "AMD" : "111"}
     
-    # korisnicke varijable ne smiju biti prefiksane ni s cim odavde
-    RESTRICTIONS = ('__while', '__aux', '__halt')
+    # korisnicke varijable ne smiju matchati nijedan od ovih patterna
+    RESTRICTIONS = (
+        '__aux',
 
-    # ne smiju postojati konstante za zatvaranje blokova koje su ujedno
-    # i makroi, to ce se provjeravati tijekom inicjalizacije
-    # ovo je komplikacija koja dopusta da razlicite konstante zatvaraju
-    # razlicite blokove, npr.
-    # FOR(A, B, C) -> DONE umjesto samo hardcodeani FOR(A, B, C) -> END 
-    BLOCK_OPENING_MACROS = {'WHILE': ('END',), 'DOWHILE': ('END',)}
-    BLOCK_CLOSING_CONSTS: dict[str, tuple[str, ...]]  # __init__
+        r'__loop_.+_\d+_start',
+        r'__loop_.+_\d+_after',
 
-    BLOCK_MACROS = {'WHILE': WHILEMacro, 'DOWHILE': DOWHILEMacro}
-    SIMPLE_MACROS = {'MV': MVMacro, 'SWP': SWPMacro,
-                     'SUM': SUMMacro, 'HALT': HALTMacro,
-                     'SET': SETMacro, 'SUB': SUBMacro}
-    MACRO_ARGCOUNTS = {'MV': 2, 'SWP': 2, 'SUM': 3, 'SUB': 3,
-                       'WHILE': 1, 'DOWHILE': 1, 'HALT': 0, 'SET': 2}
+        r'__halt_\d+',
+
+        r'__if_.+_\d+',
+        r'__ifn_.+_\d+',
+
+        r'__endandoperation_\d+',
+        r'__endoroperation_\d+',
+        r'__endxoroperation_\d+',
+        r'__endnotoperation_\d+',
+        r'__andcheckfailed_\d+',
+        r'__orcheckfailed_\d+',
+        r'__xorcheckfailed_\d+',
+        r'__xorfirstfalse_\d+',
+        r'__notfalse_\d+',
+
+        '__multresult',
+        '__multarg1',
+        '__multarg2',
+        '__multhelper',
+        r'__mult_2p\d+_\d+',
+
+        r'__registerisone_\d+',
+        r'__registerisnegativeone_\d+',
+        r'__enddiv_\d+',
+        r'__trueenddiv_\d+',
+        '__divresult',
+        '__divarg1',
+        '__divarg2',
+        '__divsign',
+        r'__div_2p\d+_\d+',
+        r'__nonnegativearg1_\d+',
+
+        '__powaux',
+        '__powresult',
+        '__powbase',
+        '__powexponent',
+        r'__exponentiseven',
+        r'__powstart_\d+',
+        r'__powend_\d+',
+        r'__powbaseisnegativeone_\d+',
+        r'__powcheckexponent_\d+',
+    )
+
+    BLOCK_MACROS = {'IF': IF, 'IFN': IFN, 'LOOP': LOOP}
+    SIMPLE_MACROS = {
+        'LD': LD, 'ADD': ADD, 'SUB': SUB, 'SWAP': SWAP,
+        'AND': AND, 'OR': OR, 'XOR': XOR, 'NOT': NOT,
+        'HALT': HALT, 'MULT': MULT, 'DIV': DIV, 'POW': POW
+    }
 
     def __init__(
         self, filename: str, output_filename: Optional[str] = None,
@@ -203,7 +114,7 @@ class Parser:
             self.output_filename = re.sub(r'\.asm$', '.expanded', filename,
                                           flags=re.IGNORECASE) + '.asm'
         else:
-            self.output_filename = output_filename
+            self.output_filename = str(output_filename)
 
         self._lines = []
 
@@ -221,17 +132,6 @@ class Parser:
 
         self._block_stack = []
         self._block_macro_stack = []
-        self.BLOCK_CLOSING_CONSTS = {
-            v: tuple(x
-                     for x in self.BLOCK_OPENING_MACROS
-                     if v in self.BLOCK_OPENING_MACROS[x])
-            for k in self.BLOCK_OPENING_MACROS
-            for v in self.BLOCK_OPENING_MACROS[k]
-        }
-        for x in self.BLOCK_OPENING_MACROS:
-            if x in self.BLOCK_CLOSING_CONSTS:
-                raise ValueError('Nevalidan parser. '
-                                 'Blok konstante ne smiju biti makroi.')
 
     def _iter_lines(self, func: Callable[[str, int, int], str]) -> None:
         newlines = []
@@ -274,7 +174,7 @@ class Parser:
                 skip_next = True
                 self._comment = not self._comment
             elif not self._comment and window == '*/':
-                raise ParsingError('PL', "Unbalanced comment delimiter.", o)
+                raise ParserError('PL', "Unbalanced comment delimiter.", o)
             elif window == '//' and not self._comment:
                 break
             elif not window[0].isspace() and not self._comment:
@@ -287,7 +187,7 @@ class Parser:
         split_label = line[1:].split(')')
         label = split_label[0]
         if len(split_label) != 2 or split_label[1] != '' or label == '':
-            raise ParsingError('SYM', f'Invalid label: `{label}\'', o)
+            raise ParserError('SYM', f'Invalid label: `{label}\'', o)
         self._labels[label] = p
         return ""
 
@@ -327,7 +227,7 @@ class Parser:
             error_message = f"Invalid jump: {jmp_str}"
             jmp = self.JUMPS[jmp_str]
         except KeyError:
-            raise ParsingError('COM', error_message, o)
+            raise ParserError('COM', error_message, o)
         
         return f"111{op}{dest}{jmp}"
 
@@ -335,9 +235,9 @@ class Parser:
         if line[0] not in '(@':
             return line
         for r in self.RESTRICTIONS:
-            if line[1:].startswith(r):
-                raise ParsingError('MCR',
-                                   f"Simbol ne smije pocinjati s {r}",
+            if re.match(r, line[1:-1]):
+                raise ParserError('MCR',
+                                   f"Zabranjeno ime simbola.",
                                    o)
         return line
 
@@ -345,76 +245,159 @@ class Parser:
         if line[0] != '$':
             return line
 
-        if line[1:] in self.BLOCK_CLOSING_CONSTS:
-            return line
-
-        if self.MACRO_ARGCOUNTS.get(line[1:], None) is not None:
-            raise ParsingError('MCR', f'Makro {line[1:]} treba zagrade.', o)
+        if (
+            line[1:].split('(')[0] not in self.SIMPLE_MACROS
+            and line[1:].split('(')[0] not in self.BLOCK_MACROS
+        ):
+            raise ParserError(
+                'MCR',
+                f"Nepoznat makro {line[1:].split('(')[0]}.",
+                o
+            )
 
         if (
             line.count('(') != 1 or
             line.count(')') != 1 or
-            not line.endswith(')')
-        ):
-            raise ParsingError('MCR', 'Nevalidna makro sintaksa.', o)
 
-        macro, sarguments = line[1:-1].split('(')
-        if macro not in self.MACRO_ARGCOUNTS:
-            raise ParsingError('MCR', f'Nepoznat makro: {macro}', o)
+            line.split(')')[1].count('{') > 1 or
+            line.split(')')[1].count('}') > 1 or
+
+            (line.split(')')[1].count('{') == 0 and
+             line.split(')')[1].count('}') == 1) or
+
+            (not line.endswith(')') and
+             not line.endswith('){') and
+             not line.endswith('){}'))
+        ):
+            raise ParserError(
+                'MCR',
+                'Nevalidna makro sintaksa.',
+                o
+            )
+
+        if (
+            line[1:].split(')')[1] and
+            line[1:].split('(')[0] in self.SIMPLE_MACROS
+        ):
+            raise ParserError(
+                'MCR',
+                'Nevalidna makro sintaksa. Blok na simple makru.',
+                o
+            )
+
+
+        macro, sarguments, _ = re.split('[()]', line[1:])
         if line.endswith('()'):
             arguments = []
         else:
             arguments = [arg.strip() for arg in sarguments.split(',')]
-        if self.MACRO_ARGCOUNTS[macro] != len(arguments):
-            raise ParsingError(
+        if (
+            (
+                macro in self.SIMPLE_MACROS and
+                (ec := self.SIMPLE_MACROS[macro].arg_count) != len(arguments)
+            ) or (
+                macro in self.BLOCK_MACROS and
+                (ec := self.BLOCK_MACROS[macro].arg_count) != len(arguments)
+
+            )
+        ):
+            raise ParserError(
                 'MCR',
                 f'Krivi broj argumenata za macro {macro}: got '
-                f'{len(arguments)}, expected {self.MACRO_ARGCOUNTS[macro]}',
+                f'{len(arguments)}, expected {ec}',
                 o,
             )
         
         for arg in arguments:
             for r in self.RESTRICTIONS:
                 if arg.startswith(r):
-                    raise ParsingError('MCR',
+                    raise ParserError('MCR',
                                        f'Simbol ne smije pocinjati s {r}',
                                        o)
         return line
 
     def _check_balanced_blocks(self, line: str, p: int, o: int) -> str:
-        if not line.startswith('$'):
+        if not line.startswith('$') and line not in ('{', '}', '{}'):
+            # allow omitting {} for single lines
+            if self._block_stack and not self._block_stack[-1][1]:
+                self._block_stack.pop()
             return line
-        macro = line[1:].split('(')[0]
-        if macro in self.BLOCK_OPENING_MACROS:
-            self._block_stack.append(macro)
-        elif macro in self.BLOCK_CLOSING_CONSTS:
-            if len(self._block_stack) == 0:
-                raise ParsingError('MCR', 'Nebalansirani makro blokovi.', o)
-            if macro not in self.BLOCK_OPENING_MACROS[self._block_stack[-1]]:
-                raise ParsingError('MCR', 'Kriva makro closing konstanta.', o)
+        if line in ('{', '}', '{}') and len(self._block_stack) == 0:
+            raise ParserError('MCR', 'Nebalansirani makro blokovi.', o)
+        if line in ('{', '{}') and self._block_stack[-1][1]:
+            raise ParserError('MCR', 'Nebalansirani makro blokovi.', o)
+        if line == '}' and not self._block_stack[-1][1]:
+            raise ParserError('MCR', 'Nebalansirani makro blokovi.', o)
+
+        if line == '{':
+            self._block_stack.append((self._block_stack.pop()[0], True))
+            return line
+        if line == '}':
             self._block_stack.pop()
+            return line
+        # no need to add anything to the stack
+        if line.endswith('{}'):
+            return line
+
+        macro = line[1:].split('(')[0]
+        is_open = line.endswith('{')
+
+        if macro in self.BLOCK_MACROS:
+            self._block_stack.append((macro, is_open))
+        elif macro in self.SIMPLE_MACROS:
+            # allow omitting {} for single lines
+            if self._block_stack and not self._block_stack[-1][1]:
+                self._block_stack.pop()
+
         return line
 
     def _parse_macro(self, line: str, p: int, o: int) -> str:
-        if not line.startswith('$'):
-            return line
-        macro = ''
-        arguments: tuple[str, ...] = ()
-        if line[1:] not in self.BLOCK_CLOSING_CONSTS:
-            macro, sarguments = line[1:-1].split('(')
-            arguments = tuple(arg.strip() for arg in sarguments.split(','))
+        if not line.startswith('$') and line not in ('{', '}', '{}'):
+            cl = ""
+            if self._block_macro_stack and not self._block_macro_stack[-1][1]:
+                cl = self._block_macro_stack[-1][0].close(line, p, o)
+                self._block_macro_stack.pop()
+            return f"{line}\n{cl}".rstrip('\n')
+
+        if line == '{':
+            self._block_stack.append((self._block_stack.pop()[0], True))
+            return self._block_macro_stack[-1][0].open(line, p, o)
+        if line == '}':
+            popped_macro = self._block_macro_stack.pop()[0]
+            return popped_macro.close(line, p, o)
+        if line == '{}':
+            op = self._block_macro_stack[-1][0].open(line, p, o)
+            cl = self._block_macro_stack[-1][0].close(line, p, o)
+            self._block_macro_stack.pop()
+            return f"{op}\n{cl}".strip('\n')
+
+
+        macro, sarguments, line_ending = re.split("[()]", line[1:])
+        arguments = tuple(arg.strip() for arg in sarguments.split(','))
 
         simple_macro = self.SIMPLE_MACROS.get(macro, None)
         block_macro = self.BLOCK_MACROS.get(macro, None)
 
         if simple_macro:
-            return simple_macro(arguments).run(line, p, o)
+            sm = simple_macro(arguments).run(line, p, o)
+            cl = ""
+            if self._block_macro_stack and not self._block_macro_stack[-1][1]:
+                cl = self._block_macro_stack[-1][0].close(line, p, o)
+                self._block_macro_stack.pop()
+            return f"{sm}\n{cl}".rstrip('\n')
         elif block_macro:
-            self._block_macro_stack.append(block_macro(arguments, p, o))
-            return self._block_macro_stack[-1].open(line, p, o)
-        else:
-            fmacro = self._block_macro_stack.pop()
-            return fmacro.close(line, p, o)
+            self._block_macro_stack.append(
+                (block_macro(arguments, p, o), line_ending == '{')
+            )
+            if line_ending == '{':
+                return self._block_macro_stack[-1][0].open(line, p, o)
+            elif line_ending == '{}':
+                op = self._block_macro_stack[-1][0].open(line, p, o)
+                cl = self._block_macro_stack[-1][0].close(line, p, o)
+                self._block_macro_stack.pop()
+                return f"{op}\n{cl}".strip('\n')
+            return ""
+        assert False
 
 
     def _parse_macros(self) -> None:
@@ -422,8 +405,11 @@ class Parser:
         self._iter_lines(self._check_macro_syntax)
         self._iter_lines(self._check_balanced_blocks)
         if self._block_stack:
-            raise ParsingError('MCR', 'Nebalansirani makro blokovi.', -1)
-        self._iter_lines(self._parse_macro)
+            raise ParserError('MCR', 'Nebalansirani makro blokovi.', -1)
+        while True:
+            self._iter_lines(self._parse_macro)
+            if all(not line.line.startswith('$') for line in self._lines):
+                break
 
 
     def _full_parse(self) -> None:
@@ -434,7 +420,7 @@ class Parser:
                 return
             self._parse_symbols()
             self._parse_commands()
-        except ParsingError as error:
+        except ParserError as error:
             if error.lineno != -1:
                 print(f"[{error.src},{error.lineno}] {error.msg}", file=stderr)
             else:
